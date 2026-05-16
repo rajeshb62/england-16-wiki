@@ -1,0 +1,632 @@
+#!/usr/bin/env python3
+"""
+Deploy any wiki from ~/hermes/history/ as a GitHub Pages site.
+
+Usage:
+    ./deploy-wiki <wiki-folder-name>
+
+Examples:
+    ./deploy-wiki "vijayanagara 15th century"
+    ./deploy-wiki "venice 15th and 16th century"
+    ./deploy-wiki "dutch republic 16th and 17th century"
+
+The script handles both first-time and update deployments.
+"""
+
+import os
+import re
+import sys
+import json
+import time
+import shutil
+import subprocess
+from pathlib import Path
+
+HISTORY_DIR = Path.home() / "hermes" / "history"
+DEPLOYER_DIR = HISTORY_DIR / "_deployer"
+CONTENT_DIR = DEPLOYER_DIR / "content"
+GITHUB_USER = "rajeshb62"
+
+# Standard ignore patterns for all wikis
+IGNORE_PATTERNS = [
+    ".obsidian", "private", "templates", "raw", "log.md",
+    "Untitled.md", "unextracted-works.md", "wikilinks.md",
+    "queries", "SCHEMA.md",
+]
+
+
+def make_slug(name: str) -> str:
+    """Convert a wiki folder name to a URL-safe base slug (no century)."""
+    s = name.lower()
+    # Remove century/era markers — handle all patterns:
+    # "15th century", "15th and 16th century", "16th 17th century"
+    s = re.sub(r'\s+\d+(st|nd|rd|th)(?:\s+(?:and\s+)?\d+(st|nd|rd|th))?\s+century$', '', s)
+    # Clean up remaining connectors
+    s = re.sub(r'\s+and\s+', ' ', s)
+    # Replace remaining spaces with hyphens, strip non-alphanumeric
+    s = re.sub(r'[^a-z0-9\s-]', '', s)
+    s = re.sub(r'\s+', '-', s.strip())
+    s = re.sub(r'-+', '-', s)
+    return s
+
+
+def compute_slugs(wiki_names: list[str]) -> dict[str, str]:
+    """Compute slugs for all wikis, resolving clashes by appending century number."""
+    # First pass: compute base slugs
+    slug_map: dict[str, list[str]] = {}  # slug -> original names
+    result = {}
+    
+    for name in wiki_names:
+        base = make_slug(name)
+        if base not in slug_map:
+            slug_map[base] = []
+        slug_map[base].append(name)
+    
+    # Second pass: resolve clashes
+    for base, names in slug_map.items():
+        if len(names) == 1:
+            result[names[0]] = base
+        else:
+            for name in names:
+                # Extract first century number for differentiation
+                century_match = re.search(r'(\d+)', name)
+                if century_match:
+                    result[name] = f"{base}-{century_match.group(1)}"
+                else:
+                    result[name] = base
+    
+    return result
+
+
+def compute_title(wiki_name: str) -> tuple[str, str]:
+    """Derive page title and suffix from folder name."""
+    base = wiki_name
+    # Extract century info for suffix
+    # Matches: "15th century", "15th and 16th century", "16th 17th century"
+    century_match = re.search(r'(\d+(?:st|nd|rd|th)(?:\s+(?:and\s+)?\d+(?:st|nd|rd|th))?\s+century)', base)
+    suffix = ""
+    if century_match:
+        suffix = " — " + century_match.group(1).strip()
+        base = base.replace(century_match.group(0), "").strip()
+    
+    # Clean up trailing connectors
+    base = base.strip(" ,-–").strip()
+    
+    # Title-case nicely — handle "th" and other ordinals properly
+    def smart_title(s: str) -> str:
+        """Title-case that preserves ordinals like 15th, 16th, etc."""
+        words = s.split()
+        result = []
+        for w in words:
+            if re.match(r'^\d+(st|nd|rd|th)$', w, re.IGNORECASE):
+                # Preserve ordinal as-is (lowercase th/nd/rd/st)
+                result.append(w.lower())
+            elif w.lower() in ('and', 'the', 'of', 'in', 'for', 'to', 'a', 'an', 'by', 'with'):
+                # Lowercase small words except first word
+                if not result:
+                    result.append(w.capitalize())
+                else:
+                    result.append(w.lower())
+            else:
+                result.append(w.capitalize())
+        # Ensure first word is capitalized
+        if result and result[0][0].islower():
+            result[0] = result[0][0].upper() + result[0][1:]
+        return ' '.join(result)
+    
+    title = smart_title(base)
+    
+    return title if title else wiki_name, suffix
+
+
+def needs_quoting(value: str) -> bool:
+    """Check if a YAML scalar value needs quoting for js-yaml compatibility.
+    
+    js-yaml chokes on:
+    - [[wikilinks]] in unquoted strings
+    - colons followed by space inside parentheses (flow context)
+    - certain special characters in bare strings
+    """
+    if not value:
+        return False
+    if value.startswith('"') and value.endswith('"'):
+        return False  # already quoted
+    if value.startswith("'") and value.endswith("'"):
+        return False  # already quoted
+    # Check for wikilinks
+    if '[[' in value and ']]' in value:
+        return True
+    # Check for colon-space that could confuse js-yaml in flow context
+    if re.search(r':\s', value):
+        return True
+    # Check for other YAML-tricky characters
+    if '{' in value or '}' in value or '[' in value or ']' in value:
+        return True
+    return False
+
+
+def quote_yaml_value(value: str) -> str:
+    """Quote a YAML scalar value properly, escaping internal quotes."""
+    escaped = value.replace('\\', '\\\\').replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def fix_yaml_frontmatter(wiki_path: Path):
+    """Fix YAML frontmatter issues for Quartz/js-yaml compatibility.
+    
+    Handles:
+    1. [[wikilinks]] in see-also fields (must be quoted)
+    2. Colons in list items (e.g. sources) that confuse js-yaml
+    """
+    fixed_files = 0
+    for root, dirs, files in os.walk(wiki_path):
+        rel = os.path.relpath(root, wiki_path)
+        if rel.startswith(('raw', 'assets', '.obsidian', 'queries', 'private', 'templates')):
+            continue
+        for fname in files:
+            if not fname.endswith('.md'):
+                continue
+            fpath = os.path.join(root, fname)
+            with open(fpath, encoding='utf-8') as f:
+                content = f.read()
+            if not content.startswith('---'):
+                continue
+
+            # Quick check: if no problematic patterns, skip
+            if '[[' not in content and ']]' not in content and not re.search(r':\s', content):
+                continue
+
+            lines = content.split('\n')
+            new_lines = []
+            in_fm = False
+            modified = False
+            in_block_list = False
+            list_indent = 0
+            list_key = None
+
+            i = 0
+            while i < len(lines):
+                line = lines[i]
+                
+                # Detect frontmatter start/end
+                if i == 0 and line == '---':
+                    in_fm = True
+                    new_lines.append(line)
+                    i += 1
+                    continue
+                if in_fm and line == '---':
+                    in_fm = False
+                    new_lines.append(line)
+                    i += 1
+                    continue
+
+                if not in_fm:
+                    new_lines.append(line)
+                    i += 1
+                    continue
+
+                # --- Inside frontmatter ---
+                stripped = line.lstrip()
+                indent = len(line) - len(stripped)
+
+                # Detect a new key (non-indented, not a list item)
+                key_match = re.match(r'^(\w[\w_-]*):\s*(.*)', line)
+                if key_match and indent == 0:
+                    in_block_list = False
+                    list_key = key_match.group(1)
+                    value = key_match.group(2)
+                    if value and needs_quoting(value):
+                        new_lines.append(f'{list_key}: {quote_yaml_value(value)}')
+                        modified = True
+                        i += 1
+                        continue
+                    new_lines.append(line)
+                    i += 1
+                    continue
+
+                # Detect continuation of multi-line values (indented)
+                if indent > 0 and in_block_list and list_key:
+                    if needs_quoting(stripped):
+                        # This is a continuation of a list item; the whole item needs attention
+                        # Actually, for multi-line YAML, js-yaml is generally ok if each line is indented
+                        pass
+                
+                # Handle ` key: [...]` inline flow mappings
+                # Nope, let me not overthink this. Handle list items directly.
+                
+                # Check if this is a block sequence item
+                list_match = re.match(r'^(\s*)-\s+(.*)', line)
+                if list_match:
+                    in_block_list = True
+                    item_indent = len(list_match.group(1))
+                    item_value = list_match.group(2)
+                    if needs_quoting(item_value):
+                        new_lines.append(f'{list_match.group(1)}- {quote_yaml_value(item_value)}')
+                        modified = True
+                        i += 1
+                        continue
+                
+                new_lines.append(line)
+                i += 1
+
+            if modified:
+                with open(fpath, 'w', encoding='utf-8') as f:
+                    f.write('\n'.join(new_lines))
+                fixed_files += 1
+    
+    return fixed_files
+
+
+def write_config(wiki_slug: str, page_title: str, suffix: str, repo_name: str):
+    """Write quartz.config.ts for this wiki."""
+    config_content = f'''import {{ QuartzConfig }} from "./quartz/cfg"
+import * as Plugin from "./quartz/plugins"
+
+const config: QuartzConfig = {{
+  configuration: {{
+    pageTitle: "{page_title}",
+    pageTitleSuffix: "{suffix}",
+    enableSPA: true,
+    enablePopovers: true,
+    locale: "en-US",
+    baseUrl: "{GITHUB_USER}.github.io/{repo_name}",
+    ignorePatterns: {json.dumps(IGNORE_PATTERNS)},
+    defaultDateType: "modified",
+    theme: {{
+      fontOrigin: "googleFonts",
+      cdnCaching: true,
+      typography: {{
+        header: "Schibsted Grotesk",
+        body: "Source Sans Pro",
+        code: "IBM Plex Mono",
+      }},
+      colors: {{
+        lightMode: {{
+          light: "#faf8f8",
+          lightgray: "#e5e5e5",
+          gray: "#b8b8b8",
+          darkgray: "#4e4e4e",
+          dark: "#2b2b2b",
+          secondary: "#284b63",
+          tertiary: "#84a59d",
+          highlight: "rgba(143, 159, 169, 0.15)",
+          textHighlight: "#fff23688",
+        }},
+        darkMode: {{
+          light: "#161618",
+          lightgray: "#393639",
+          gray: "#646464",
+          darkgray: "#d4d4d4",
+          dark: "#ebebec",
+          secondary: "#7b97aa",
+          tertiary: "#84a59d",
+          highlight: "rgba(143, 159, 169, 0.15)",
+          textHighlight: "#b3aa0288",
+        }},
+      }},
+    }},
+  }},
+  plugins: {{
+    transformers: [
+      Plugin.FrontMatter(),
+      Plugin.CreatedModifiedDate({{
+        priority: ["frontmatter", "git", "filesystem"],
+      }}),
+      Plugin.SyntaxHighlighting({{
+        theme: {{
+          light: "github-light",
+          dark: "github-dark",
+        }},
+        keepBackground: false,
+      }}),
+      Plugin.ObsidianFlavoredMarkdown({{ enableInHtmlEmbed: false }}),
+      Plugin.GitHubFlavoredMarkdown(),
+      Plugin.TableOfContents(),
+      Plugin.CrawlLinks({{ markdownLinkResolution: "shortest" }}),
+      Plugin.Description(),
+      Plugin.Latex({{ renderEngine: "katex" }}),
+    ],
+    filters: [Plugin.RemoveDrafts()],
+    emitters: [
+      Plugin.AliasRedirects(),
+      Plugin.ComponentResources(),
+      Plugin.ContentPage(),
+      Plugin.FolderPage(),
+      Plugin.TagPage(),
+      Plugin.ContentIndex({{
+        enableSiteMap: true,
+        enableRSS: true,
+      }}),
+      Plugin.Assets(),
+      Plugin.Static(),
+      Plugin.Favicon(),
+      Plugin.NotFoundPage(),
+      // Plugin.CustomOgImages(),
+    ],
+  }},
+}}
+
+export default config
+'''
+    (DEPLOYER_DIR / "quartz.config.ts").write_text(config_content)
+
+
+def write_layout(repo_name: str):
+    """Write quartz.layout.ts."""
+    layout_content = f'''import {{ PageLayout, SharedLayout }} from "./quartz/cfg"
+import * as Component from "./quartz/components"
+
+export const sharedPageComponents: SharedLayout = {{
+  head: Component.Head(),
+  header: [],
+  afterBody: [],
+  footer: Component.Footer({{
+    links: {{
+      "Source Repo": "https://github.com/{GITHUB_USER}/{repo_name}",
+    }},
+  }}),
+}}
+
+export const defaultContentPageLayout: PageLayout = {{
+  beforeBody: [
+    Component.ConditionalRender({{
+      component: Component.Breadcrumbs(),
+      condition: (page) => page.fileData.slug !== "index",
+    }}),
+    Component.ArticleTitle(),
+    Component.ContentMeta(),
+    Component.TagList(),
+  ],
+  left: [
+    Component.PageTitle(),
+    Component.MobileOnly(Component.Spacer()),
+    Component.Flex({{
+      components: [
+        {{
+          Component: Component.Search(),
+          grow: true,
+        }},
+        {{ Component: Component.Darkmode() }},
+        {{ Component: Component.ReaderMode() }},
+      ],
+    }}),
+    Component.Explorer(),
+  ],
+  right: [
+    Component.Graph(),
+    Component.DesktopOnly(Component.TableOfContents()),
+    Component.Backlinks(),
+  ],
+}}
+
+export const defaultListPageLayout: PageLayout = {{
+  beforeBody: [Component.Breadcrumbs(), Component.ArticleTitle(), Component.ContentMeta()],
+  left: [
+    Component.PageTitle(),
+    Component.MobileOnly(Component.Spacer()),
+    Component.Flex({{
+      components: [
+        {{
+          Component: Component.Search(),
+          grow: true,
+        }},
+        {{ Component: Component.Darkmode() }},
+      ],
+    }}),
+    Component.Explorer(),
+  ],
+  right: [],
+}}
+'''
+    (DEPLOYER_DIR / "quartz.layout.ts").write_text(layout_content)
+
+
+def write_deploy_workflow():
+    """Write .github/workflows/deploy.yml."""
+    workflow_dir = DEPLOYER_DIR / ".github" / "workflows"
+    workflow_dir.mkdir(parents=True, exist_ok=True)
+    
+    workflow = '''name: Deploy to GitHub Pages
+on:
+  push:
+    branches: [main]
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install dependencies
+        run: npm ci
+      - name: Build Quartz
+        run: npx quartz build
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./public
+'''
+    (workflow_dir / "deploy.yml").write_text(workflow)
+
+
+def run(cmd, cwd=None, check=True) -> str:
+    """Run a shell command and return stdout."""
+    result = subprocess.run(cmd, shell=True, cwd=cwd or str(DEPLOYER_DIR),
+                           capture_output=True, text=True, timeout=300)
+    if check and result.returncode != 0:
+        print(f"ERROR: Command failed: {cmd}")
+        print(f"stderr: {result.stderr}")
+        print(f"stdout: {result.stdout}")
+        sys.exit(1)
+    return result.stdout.strip()
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: ./deploy-wiki <wiki-folder-name>")
+        print()
+        print("Examples:")
+        print("  ./deploy-wiki \"vijayanagara 15th century\"")
+        print("  ./deploy-wiki \"venice 15th and 16th century\"")
+        print("  ./deploy-wiki \"dutch republic 16th and 17th century\"")
+        print("  ./deploy-wiki --list")
+        sys.exit(1)
+    
+    if sys.argv[1] == "--list":
+        print("Available wikis:")
+        for d in sorted(HISTORY_DIR.iterdir()):
+            if d.is_dir() and (d / "wiki").is_dir() and d.name != "_deployer":
+                wiki_files = len(list((d / "wiki").rglob("*.md")))
+                print(f"  {d.name}  ({wiki_files} .md files)")
+        sys.exit(0)
+    
+    # Remove trailing slash if user uses tab-completion
+    wiki_name = sys.argv[1].rstrip("/")
+    wiki_path = HISTORY_DIR / wiki_name
+    
+    if not wiki_path.is_dir():
+        print(f"Error: Wiki folder not found: {wiki_path}")
+        print("Use --list to see available wikis.")
+        sys.exit(1)
+    
+    wiki_content_path = wiki_path / "wiki"
+    if not wiki_content_path.is_dir():
+        print(f"Error: No 'wiki/' subdirectory found in {wiki_name}")
+        sys.exit(1)
+    
+    # ---- Derive names ----
+    # Build list of all wiki names for clash-aware slug computation
+    all_wiki_names = []
+    for d in sorted(HISTORY_DIR.iterdir()):
+        if d.is_dir() and (d / "wiki").is_dir() and d.name != "_deployer":
+            all_wiki_names.append(d.name)
+    slugs = compute_slugs(all_wiki_names)
+    wiki_slug = slugs[wiki_name]
+    repo_name = f"{wiki_slug}-wiki"
+    page_title, suffix = compute_title(wiki_name)
+    
+    print(f"=== Deploying Wiki: {wiki_name} ===")
+    print(f"  Repo:    {GITHUB_USER}/{repo_name}")
+    print(f"  Title:   {page_title}{suffix}")
+    print(f"  URL:     https://{GITHUB_USER}.github.io/{repo_name}/")
+    
+    # ---- Step 1: Fix wikilinks in YAML ----
+    print("\n[1/6] Fixing [[wikilinks]] in YAML frontmatter...")
+    fixed = fix_yaml_frontmatter(wiki_content_path)
+    if fixed:
+        print(f"  Fixed {fixed} file(s)")
+    else:
+        print("  No fixes needed")
+    
+    # ---- Step 2: Symlink content ----
+    print("\n[2/6] Setting up content symlink...")
+    if CONTENT_DIR.is_symlink() or CONTENT_DIR.exists():
+        if CONTENT_DIR.is_symlink():
+            CONTENT_DIR.unlink()
+        else:
+            shutil.rmtree(str(CONTENT_DIR))
+    CONTENT_DIR.symlink_to(wiki_content_path, target_is_directory=True)
+    print(f"  content → {wiki_content_path}")
+    
+    # ---- Step 3: Write config files ----
+    print("\n[3/6] Writing config files...")
+    write_config(wiki_slug, page_title, suffix, repo_name)
+    write_layout(repo_name)
+    write_deploy_workflow()
+    print("  quartz.config.ts, quartz.layout.ts, deploy.yml written")
+    
+    # ---- Step 4: Build ----
+    print("\n[4/6] Building site...")
+    build_out = run("npx quartz build", check=True)
+    # Count pages from the last line of build output
+    for line in build_out.split('\n'):
+        print(f"  {line}")
+    
+    # ---- Step 5: Git setup & push ----
+    print("\n[5/6] Setting up git and pushing...")
+    run("git init", check=False)
+    run("git checkout -b main", check=False)
+    
+    # Write .gitignore
+    gitignore = """node_modules/
+public/
+.DS_Store
+content/
+"""
+    (DEPLOYER_DIR / ".gitignore").write_text(gitignore)
+    
+    run("git add -A")
+    run('git commit -m "Deploy: {}"'.format(wiki_name), check=False)
+    
+    # Check if remote is correct
+    remote_out = run("git remote get-url origin", check=False)
+    expected_url = f"https://github.com/{GITHUB_USER}/{repo_name}.git"
+    if remote_out and expected_url in remote_out:
+        print("  Remote already configured correctly")
+    else:
+        # Remove any existing remote and set the correct one
+        run("git remote remove origin", check=False)
+        # Check if repo exists on GitHub
+        repo_check = run(f"gh repo view {GITHUB_USER}/{repo_name} --json name", check=False)
+        if repo_check and not "not found" in repo_check.lower():
+            print(f"  Repo {repo_name} already exists on GitHub")
+            run(f"git remote add origin {expected_url}")
+        else:
+            print(f"  Creating GitHub repo: {repo_name}")
+            run(f"gh repo create {repo_name} --public --source=. --remote=origin --push", check=False)
+            # If create succeeded with push, skip the later push step
+            if run("git remote get-url origin", check=False) == expected_url:
+                pass  # already pushed
+            else:
+                run(f"git remote add origin {expected_url}")
+    
+    # Push (if not already done by gh repo create --push)
+    current_remote = run("git remote get-url origin", check=False)
+    if current_remote == expected_url:
+        run("git push -u origin main --force")
+    
+    # ---- Step 6: Enable GitHub Pages ----
+    print("\n[6/6] Enabling GitHub Pages...")
+    pages_configured = False
+    for attempt in range(4):
+        pages_result = run(
+            f"gh api repos/{GITHUB_USER}/{repo_name}/pages --method POST "
+            f"-f build_type=legacy "
+            f"-f source.branch=gh-pages "
+            f"-f source.path=/",
+            check=False
+        )
+        # Check if already configured (409) or first-time success
+        if "already enabled" in pages_result.lower() or "html_url" in pages_result:
+            pages_configured = True
+            try:
+                data = json.loads(pages_result) if pages_result.startswith('{') else None
+                if data and "html_url" in data:
+                    print(f"  Pages URL: {data.get('html_url', '')}")
+                else:
+                    print("  Pages already configured")
+            except (json.JSONDecodeError, ValueError):
+                print("  Pages already configured")
+            break
+        
+        if attempt < 3:
+            wait = 15
+            print(f"  Waiting {wait}s before retry (attempt {attempt + 2}/4)...")
+            time.sleep(wait)
+    
+    if not pages_configured:
+        print("  Could not configure Pages automatically.")
+        print(f"  Go to: https://github.com/{GITHUB_USER}/{repo_name}/settings/pages")
+        print("  Source: Deploy from branch → gh-pages → /")
+    
+    print(f"\n✓ Done! Site will be live at:")
+    print(f"  https://{GITHUB_USER}.github.io/{repo_name}/")
+    print(f"  (First deploy may take 30-60s; subsequent ones are instant)")
+
+
+if __name__ == "__main__":
+    main()
